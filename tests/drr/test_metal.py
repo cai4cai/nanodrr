@@ -73,13 +73,60 @@ def test_metal_ray_missing_volume_is_zero():
     assert (out == 0).all()
 
 
-def test_metal_half_precision_subject_matches_float32():
-    subject, k_inv, rt_inv, sdd, h, w = _setup()
-    ref = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=100, backend="metal")
-    out = render(subject.half(), k_inv, rt_inv, sdd, h, w, n_samples=100, backend="metal")
+def _reduced(n_classes, dtype, device):
+    """A subject with only the volume and labelmap stored in `dtype`, plus its float32 twin
+    holding the same (quantized) values. Geometry stays float32, as `Subject.to` would not."""
+    ref = make_random_subject(n_classes=n_classes)
+    ref._image_hu = ref._image_hu.to(dtype).float()  # quantize, so both see identical samples
+    low = make_random_subject(n_classes=n_classes)
+    low._image_hu = ref._image_hu.to(dtype)
+    low.label = low.label.to(dtype)
+    return ref.to(device), low.to(device, dtype=None)
 
-    assert out.shape == ref.shape
-    assert ((ref - out.float()).abs().max() / ref.abs().max()).item() < 1e-2
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("n_classes", [1, 3])
+def test_metal_reduced_precision_volume_matches_quantized_float32(dtype, n_classes):
+    device = torch.device("mps")
+    ref, low = _reduced(n_classes, dtype, device)
+    k_inv, rt_inv, sdd, h, w = make_camera(device)
+
+    assert low.image.dtype == dtype
+    expected = render(ref, k_inv, rt_inv, sdd, h, w, n_samples=100, backend="metal")
+    out = render(low, k_inv, rt_inv, sdd, h, w, n_samples=100, backend="metal")
+
+    assert out.dtype == dtype
+    # Same samples, same float32 accumulation: only the final rounding to `dtype` differs
+    tol = {torch.float16: 2e-3, torch.bfloat16: 1.6e-2}[dtype]
+    assert ((expected - out.float()).abs().max() / expected.abs().max()).item() < tol
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_metal_reduced_precision_volume_gradient(dtype):
+    device = torch.device("mps")
+    ref, low = _reduced(1, dtype, device)
+    k_inv, rt_inv, sdd, h, w = make_camera(device)
+    grads = []
+    for subject in (ref, low):
+        subject.convert_to_mu = False
+        subject._image_hu.requires_grad_(True)
+        render(subject, k_inv, rt_inv, sdd, h, w, n_samples=100, backend="metal").float().sum().backward()
+        grads.append(subject._image_hu.grad.float())
+
+    assert low._image_hu.grad.dtype == dtype
+    assert ((grads[0] - grads[1]).abs().max() / grads[0].abs().max()).item() < 2e-2
+
+
+def test_metal_reduced_precision_halves_volume_footprint():
+    """Reduced-precision volumes are read in place, with no float32 copy."""
+    device = torch.device("mps")
+    _, low = _reduced(1, torch.float16, device)
+    k_inv, rt_inv, sdd, h, w = make_camera(device)
+    before = torch.mps.current_allocated_memory()
+    render(low, k_inv, rt_inv, sdd, h, w, n_samples=100, backend="metal")
+    torch.mps.synchronize()
+
+    assert torch.mps.current_allocated_memory() - before < low.image.numel() * 4
 
 
 @pytest.mark.parametrize("orthographic", [False, True])

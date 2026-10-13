@@ -131,8 +131,12 @@ def render_metal(
     from ._metal import metal_raymarch
 
     C = subject.n_classes
-    vol = subject.image[0, 0].float().contiguous()
-    lab = subject.label[0, 0].float().contiguous() if C > 1 else vol
+    # Float16/bfloat16 volumes are read in place; the kernel promotes per sample
+    vol = subject.image[0, 0]
+    if vol.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        vol = vol.float()
+    vol = vol.contiguous()
+    lab = subject.label[0, 0].to(vol.dtype).contiguous() if C > 1 else vol
     M = (subject.world_to_voxel.float() @ rt_inv.float())[:, :3, :]
     B = max(M.shape[0], tgt.shape[0])
     out = metal_raymarch(
@@ -146,4 +150,4 @@ def render_metal(
         C,
         width,
     )
-    return out.reshape(B, C, height, width).to(rt_inv.dtype)
+    return out.reshape(B, C, height, width).to(vol.dtype)

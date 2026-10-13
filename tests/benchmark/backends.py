@@ -1,13 +1,14 @@
 """Compare rendering backends on every (device, backend) pair this machine supports.
 
 Pairs: torch on cpu/mps/cuda, plus the fused kernels (metal on MPS, triton on CUDA).
-Reports accuracy against torch on the same device, speed, and working-set memory
+Reports accuracy against an all-float32 torch render on the same device, speed, and working-set memory
 (peak extra device memory while one render runs, on top of the resident volume).
 
 Usage: python tests/benchmark/backends.py [--grad] [--labels] [--size 200 400] [--samples 500] [--batch 1]
 """
 
 import argparse
+import copy
 import functools
 import statistics
 import time
@@ -48,6 +49,17 @@ def pose_grad(args, backend):
     return rt_inv.grad[:, :3]  # the homogeneous row's gradient is backend-specific
 
 
+def volume_grad(args, backend):
+    """Gradient of the summed render w.r.t. the volume (the subject must have `convert_to_mu` off)."""
+    subject = args[0]
+    subject._image_hu.grad = None
+    render(*args, backend=backend).sum().backward()
+    return subject._image_hu.grad
+
+
+GRADS = {"pose": pose_grad, "volume": volume_grad}
+
+
 def working_set_mb(func, device: str) -> float:
     """Peak extra device memory (MB) allocated by one call of `func`."""
     synchronize(device)
@@ -83,7 +95,14 @@ def main():
     p.add_argument("--labels", action="store_true", help="Multi-class rendering with the demo labelmap")
     p.add_argument("--size", type=int, nargs="+", default=[100, 200, 400], help="Square detector sizes")
     p.add_argument("--samples", type=int, default=500)
-    p.add_argument("--grad", action="store_true", help="Time forward + backward w.r.t. the pose")
+    p.add_argument(
+        "--grad",
+        nargs="?",
+        const="pose",
+        choices=["pose", "volume"],
+        help="Time forward + backward w.r.t. the pose (default) or the volume",
+    )
+    p.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32", help="Volume dtype")
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--device", nargs="+", default=None, choices=["cpu", "mps", "cuda"])
     p.add_argument("--runs", type=int, default=10)
@@ -93,7 +112,20 @@ def main():
 
     for device in a.device or available_devices():
         subject, _, rt_inv, sdd, _, _ = setup_data(a.image, "demo" if a.labels else None, device)
+        dt = getattr(torch, a.dtype)
+        # Errors are measured against an all-float32 torch render, so they include
+        # each backend's low-precision error; `--dtype` casts the volume, labels and geometry
+        ref_subject = copy.deepcopy(subject)
+        if a.dtype != "float32":
+            subject, rt_inv_lp, sdd_lp = subject.to(dt), rt_inv.to(dt), sdd.to(dt)
+        else:
+            rt_inv_lp, sdd_lp = rt_inv, sdd
+        if a.grad == "volume":  # differentiate the raw volume, not the HU -> mu conversion
+            for sub in (subject, ref_subject):
+                sub.convert_to_mu = False
+                sub._image_hu = sub._image_hu.detach().requires_grad_(True)
         rt_inv, sdd = rt_inv.expand(a.batch, -1, -1), sdd.expand(a.batch)
+        rt_inv_lp, sdd_lp = rt_inv_lp.expand(a.batch, -1, -1), sdd_lp.expand(a.batch)
         print(
             f"\n### {device} ({device_name(device)}): volume {tuple(subject.image.shape[2:])}, "
             f"{subject.n_classes} class(es), B={a.batch}, S={a.samples}"
@@ -104,19 +136,19 @@ def main():
         for size in a.size:
             k = make_k_inv(1020.0, 400.0 / size, 400.0 / size, 0.0, 0.0, size, size)
             k = k.to(device).expand(a.batch, -1, -1)
-            args = (subject, k, rt_inv, sdd, size, size, a.samples)
-            ref = render(*args, backend="torch")
-            if a.grad:
-                ref = pose_grad(args, "torch")
+            args = (subject, k.to(dt), rt_inv_lp, sdd_lp, size, size, a.samples)
+            ref_args = (ref_subject, k, rt_inv, sdd, size, size, a.samples)
+            ref = GRADS[a.grad](ref_args, "torch") if a.grad else render(*ref_args, backend="torch")
+            ref = ref.float()
             base_us = None
             for backend in available_backends(device):
                 run = (
-                    functools.partial(pose_grad, args, backend)
+                    functools.partial(GRADS[a.grad], args, backend)
                     if a.grad
                     else functools.partial(render, *args, backend=backend)
                 )
 
-                err = ((run() - ref).abs().max() / ref.abs().max()).item()
+                err = ((run().float() - ref).abs().max() / ref.abs().max()).item()
                 iters = a.cpu_iterations if device == "cpu" else a.iterations
                 us, std = time_us(run, device, a.runs if device != "cpu" else 3, iters, 2 if device == "cpu" else 10)
                 mem = working_set_mb(run, device)

@@ -1,6 +1,7 @@
 """Fused Metal ray-marching kernels, compiled at runtime with `torch.mps.compile_shader`.
 
-Float32. One thread marches one ray: the sample grid and per-sample intensities
+Volume and labelmap may be float32, float16 or bfloat16 (read in place and
+promoted per sample; geometry and accumulation stay float32). One thread marches one ray: the sample grid and per-sample intensities
 of the `grid_sample` path are never materialized. Semantics match `_fused.py`:
 trilinear intensity sampling with zero padding, nearest-neighbor label routing
 (round-half-even) and a constant per-ray step. The backward kernel computes
@@ -12,13 +13,14 @@ import functools
 
 import torch
 
-_SOURCE = """
+_HEADER = """
 #include <metal_stdlib>
 using namespace metal;
 
-inline float fetch(device const float* v, int ix, int iy, int iz, int D, int H, int W) {
+template <typename T>
+inline float fetch(device const T* v, int ix, int iy, int iz, int D, int H, int W) {
     if (ix < 0 || ix >= W || iy < 0 || iy >= H || iz < 0 || iz >= D) return 0.0f;
-    return v[(iz * H + iy) * W + ix];
+    return (float)v[(iz * H + iy) * W + ix];
 }
 
 struct Ray {
@@ -54,9 +56,12 @@ inline Ray setup_ray(
     return r;
 }
 
+"""
+
+_KERNELS = """
 kernel void raymarch_fwd(
-    device const float* vol  [[buffer(0)]],
-    device const float* lab  [[buffer(1)]],
+    device const VT* vol     [[buffer(0)]],
+    device const VT* lab     [[buffer(1)]],
     device const float* M    [[buffer(2)]],   // [B, 3, 4] camera -> voxel pixel coords
     device const float* src  [[buffer(3)]],   // [B, N or 1, 3]
     device const float* tgt  [[buffer(4)]],   // [B, N, 3]
@@ -107,8 +112,8 @@ kernel void raymarch_fwd(
 
 kernel void raymarch_bwd(
     device const float* go   [[buffer(0)]],   // [B, C, N]
-    device const float* vol  [[buffer(1)]],
-    device const float* lab  [[buffer(2)]],
+    device const VT* vol     [[buffer(1)]],
+    device const VT* lab     [[buffer(2)]],
     device const float* M    [[buffer(3)]],
     device const float* src  [[buffer(4)]],
     device const float* tgt  [[buffer(5)]],
@@ -210,10 +215,31 @@ kernel void raymarch_bwd(
 }
 """
 
+# Volume and labelmap element types the kernels are instantiated for; geometry stays float32
+_DTYPES = {torch.float32: ("float", "f32"), torch.float16: ("half", "f16"), torch.bfloat16: ("bfloat", "bf16")}
+
+
+def _build_source() -> str:
+    """The shared helpers plus one copy of the kernels per volume dtype (`raymarch_fwd_f16`, ...)."""
+    out = [_HEADER]
+    for ctype, suffix in _DTYPES.values():
+        body = _KERNELS.replace("raymarch_fwd", f"raymarch_fwd_{suffix}").replace(
+            "raymarch_bwd", f"raymarch_bwd_{suffix}"
+        )
+        out.append(f"#define VT {ctype}\n{body}\n#undef VT\n")
+    return "\n".join(out)
+
 
 @functools.cache
 def _library():
-    return torch.mps.compile_shader(_SOURCE)
+    return torch.mps.compile_shader(_build_source())
+
+
+def _kernel(name: str, vol: torch.Tensor):
+    """The `name` kernel instantiated for the volume's dtype."""
+    if vol.dtype not in _DTYPES:
+        raise TypeError(f"metal backend supports float32, float16 and bfloat16 volumes, got {vol.dtype}")
+    return getattr(_library(), f"{name}_{_DTYPES[vol.dtype][1]}")
 
 
 def _src_strides(src: torch.Tensor) -> tuple[int, int]:
@@ -234,14 +260,14 @@ def metal_raymarch(
 ) -> torch.Tensor:
     """Fused ray march on MPS; same contract as `_fused.fused_raymarch`.
 
-    Args are dense float32 on MPS: `vol`/`lab` `[D, H, W]`, `M` `[B, 3, 4]`,
+    Args are dense on MPS: `vol`/`lab` `[D, H, W]` (float32/16 or bfloat16, same dtype), geometry float32: `M` `[B, 3, 4]`,
     `src` `[B, N, 3]` or `[B, 1, 3]`, `tgt` `[B, N, 3]`, `step` `[B, N]`.
     `width` is unused (kept for parity with the Triton op).
     """
     B, N, _ = tgt.shape
     D, H, W = vol.shape
     out = torch.zeros(B, n_classes, N, device=vol.device, dtype=torch.float32)
-    _library().raymarch_fwd(
+    _kernel("raymarch_fwd", vol)(
         vol, lab, M.contiguous(), src, tgt, step, out,
         N, D, H, W, n_samples, n_classes, *_src_strides(src),
         threads=B * N,
@@ -291,7 +317,7 @@ def _metal_raymarch_bwd(
     gtgt = torch.empty(B * N, 3, device=dev, dtype=f32) if need_gcam else gM_part.new_empty(1)
     gstep = torch.empty(B * N, device=dev, dtype=f32) if need_gcam else gM_part.new_empty(1)
 
-    _library().raymarch_bwd(
+    _kernel("raymarch_bwd", vol)(
         go.contiguous(), vol, lab, M.contiguous(), src, tgt, step,
         gM_part, gsrc, gtgt, gstep, gvol,
         N, D, H, W, n_samples, n_classes, *_src_strides(src), int(need_gvol), int(need_gcam),
