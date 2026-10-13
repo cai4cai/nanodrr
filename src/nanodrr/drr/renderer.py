@@ -4,7 +4,7 @@ import torch
 from jaxtyping import Float
 
 from ..data import Subject
-from .backends import fused_supported, render_fused, render_torch
+from .backends import fused_supported, render_fused, render_metal, render_torch
 
 _FUSED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -58,7 +58,8 @@ def render(
         tgt: Pre-computed ray target positions (detector pixel locations) in
             camera coordinates. If `None`, computed from `k_inv` and `rt_inv`.
         backend: `"torch"` uses the reference `grid_sample` implementation;
-            `"triton"` uses the fused Triton kernel; `"auto"` (default) picks
+            `"triton"` uses the fused Triton kernel; `"metal"` (experimental,
+            MPS, float32, forward only) uses a fused Metal shader; `"auto"` (default) picks
             `"triton"` on CUDA with fp32/fp16/bf16 when eligible and `"torch"`
             otherwise. The backends agree to float32 sampling precision (~1e-5);
             `"triton"` assumes an affine `rt_inv` and has no double backward.
@@ -93,9 +94,11 @@ def render(
         backend = "triton" if eligible else "torch"
     if backend == "triton":
         return render_fused(subject, rt_inv, src, tgt, step_size, n_samples, height, width)
+    if backend == "metal":
+        return render_metal(subject, rt_inv, src, tgt, step_size, n_samples, height, width)
     if backend == "torch":
         return render_torch(subject, rt_inv, src, tgt, step_size, n_samples, height, width)
-    raise ValueError(f"Unknown backend {backend!r}; expected 'auto', 'torch', or 'triton'")
+    raise ValueError(f"Unknown backend {backend!r}; expected 'auto', 'torch', 'triton', or 'metal'")
 
 
 def _make_tgt(
