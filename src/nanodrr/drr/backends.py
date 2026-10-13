@@ -209,8 +209,6 @@ def render_metal(
     """
     from ._metal import metal_raymarch
 
-    if soft_labels and subject.n_classes > 1:
-        raise NotImplementedError("backend='metal' does not support soft_labels yet; use backend='torch'")
     if not rt_inv.is_mps:
         raise ValueError("backend='metal' requires MPS tensors; use backend='torch'")
     if not fused_supported(subject, max(rt_inv.shape[0], tgt.shape[0]), height * width):
@@ -237,5 +235,6 @@ def render_metal(
         n_samples,
         C,
         width,
+        soft_labels and C > 1,
     )
     return out.reshape(B, C, height, width).to(vol.dtype)

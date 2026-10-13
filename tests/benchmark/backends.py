@@ -4,7 +4,7 @@ Pairs: torch on cpu/mps/cuda, plus the fused kernels (metal on MPS, triton on CU
 Reports accuracy against an all-float32 torch render on the same device, speed, and working-set memory
 (peak extra device memory while one render runs, on top of the resident volume).
 
-Usage: python tests/benchmark/backends.py [--grad] [--labels] [--size 200 400] [--samples 500] [--batch 1]
+Usage: python tests/benchmark/backends.py [--grad {pose,volume}] [--labels | --soft-labels] [--size 200 400] [--samples 500] [--batch 1]
 """
 
 import argparse
@@ -38,19 +38,19 @@ def available_backends(device: str) -> list[str]:
     return backends
 
 
-def pose_grad(args, backend):
+def pose_grad(args, backend, soft_labels=False):
     """Gradient of the summed render w.r.t. the pose (one forward + backward pass)."""
     subject, k_inv, rt_inv, *rest = args
     rt_inv = rt_inv.detach().clone().requires_grad_(True)
-    render(subject, k_inv, rt_inv, *rest, backend=backend).sum().backward()
+    render(subject, k_inv, rt_inv, *rest, backend=backend, soft_labels=soft_labels).sum().backward()
     return rt_inv.grad[:, :3]  # the homogeneous row's gradient is backend-specific
 
 
-def volume_grad(args, backend):
+def volume_grad(args, backend, soft_labels=False):
     """Gradient of the summed render w.r.t. the volume (the subject must have `convert_to_mu` off)."""
     subject = args[0]
     subject._image_hu.grad = None
-    render(*args, backend=backend).sum().backward()
+    render(*args, backend=backend, soft_labels=soft_labels).sum().backward()
     return subject._image_hu.grad
 
 
@@ -90,6 +90,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--image", default=None)
     p.add_argument("--labels", action="store_true", help="Multi-class rendering with the demo labelmap")
+    p.add_argument(
+        "--soft-labels", action="store_true", help="Trilinear (partial-volume) label assignment; implies --labels"
+    )
     p.add_argument("--size", type=int, nargs="+", default=[100, 200, 400], help="Square detector sizes")
     p.add_argument("--samples", type=int, default=500)
     p.add_argument(
@@ -108,7 +111,7 @@ def main():
     a = p.parse_args()
 
     for device in a.device or available_devices():
-        subject, _, rt_inv, sdd, _, _ = setup_data(a.image, "demo" if a.labels else None, device)
+        subject, _, rt_inv, sdd, _, _ = setup_data(a.image, "demo" if a.labels or a.soft_labels else None, device)
         dt = getattr(torch, a.dtype)
         # Errors are measured against an all-float32 torch render, so they include
         # each backend's low-precision error; `--dtype` casts the volume, labels and geometry
@@ -135,14 +138,18 @@ def main():
             k = k.to(device).expand(a.batch, -1, -1)
             args = (subject, k.to(dt), rt_inv_lp, sdd_lp, size, size, a.samples)
             ref_args = (ref_subject, k, rt_inv, sdd, size, size, a.samples)
-            ref = GRADS[a.grad](ref_args, "torch") if a.grad else render(*ref_args, backend="torch")
+            ref = (
+                GRADS[a.grad](ref_args, "torch", a.soft_labels)
+                if a.grad
+                else render(*ref_args, backend="torch", soft_labels=a.soft_labels)
+            )
             ref = ref.float()
             base_us = None
             for backend in available_backends(device):
                 run = (
-                    functools.partial(GRADS[a.grad], args, backend)
+                    functools.partial(GRADS[a.grad], args, backend, a.soft_labels)
                     if a.grad
-                    else functools.partial(render, *args, backend=backend)
+                    else functools.partial(render, *args, backend=backend, soft_labels=a.soft_labels)
                 )
 
                 err = ((run().float() - ref).abs().max() / ref.abs().max()).item()

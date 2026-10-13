@@ -109,7 +109,7 @@ def render(
         )
         if eligible and rt_inv.is_cuda and _triton_available():
             backend = "triton"
-        elif eligible and not soft_labels and rt_inv.is_mps and _metal_available(subject.image.dtype):
+        elif eligible and rt_inv.is_mps and _metal_available(subject.image.dtype):
             backend = "metal"
         else:
             backend = "torch"

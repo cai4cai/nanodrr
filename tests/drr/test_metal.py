@@ -284,3 +284,96 @@ def test_metal_backend_rejects_non_mps_tensors():
 
     with pytest.raises(ValueError, match="MPS"):
         render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="metal")
+
+
+@pytest.mark.parametrize("orthographic", [False, True])
+@pytest.mark.parametrize("batched_pose", [False, True])
+def test_metal_matches_torch_forward_soft_labels(parity, orthographic, batched_pose):
+    """Soft-label routing is continuous, so every channel must match (no flipped samples)."""
+    ref, out = _render_both(parity, 3, orthographic, batched_pose, soft_labels=True)
+
+    assert out.shape == ref.shape
+    assert ((ref - out).abs().max() / ref.abs().max()).item() < 1e-4
+
+
+@pytest.mark.parametrize("kind", ["pose", "volume", "intrinsics"])
+def test_metal_matches_torch_gradients_soft_labels(parity, kind):
+    _assert_grads_match(parity, kind, n_classes=3, soft_labels=True)
+
+
+def test_metal_soft_labels_equal_masked_volume_renders():
+    """Channel c of a soft-label render is the plain render of the volume masked to class c."""
+    subject, k_inv, rt_inv, sdd, h, w = _setup(n_classes=3)
+    soft = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=100, backend="metal", soft_labels=True)
+
+    for c in range(3):
+        masked = subject.__class__(
+            imagedata=subject.image * (subject.label == c),
+            labeldata=torch.zeros_like(subject.label),
+            voxel_to_world=subject.voxel_to_world,
+            world_to_voxel=subject.world_to_voxel,
+            voxel_to_grid=subject.voxel_to_grid,
+            isocenter=subject.isocenter,
+            max_label=0,
+            convert_to_mu=False,
+        )
+        ref = render(masked, k_inv, rt_inv, sdd, h, w, n_samples=100, backend="metal")
+        assert (soft[:, c : c + 1] - ref).abs().max().item() < 1e-4 * ref.abs().max().item()
+
+
+def test_metal_soft_labels_are_ignored_for_a_single_class():
+    subject, k_inv, rt_inv, sdd, h, w = _setup(n_classes=1)
+    hard = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="metal")
+    soft = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="metal", soft_labels=True)
+
+    torch.testing.assert_close(soft, hard, rtol=0, atol=0)
+
+
+def test_metal_soft_labels_drop_out_of_range_labels():
+    subject, k_inv, rt_inv, sdd, h, w = _setup(n_classes=5)
+    subject.n_classes = 3
+    rt = rt_inv.clone().requires_grad_(True)
+    out = render(subject, k_inv, rt, sdd, h, w, n_samples=100, backend="metal", soft_labels=True)
+    out.sum().backward()
+
+    assert out.shape[1] == 3
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(rt.grad).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_metal_soft_labels_reduced_precision_volume(dtype):
+    device = torch.device("mps")
+    ref, low = _reduced(3, dtype, device)
+    k_inv, rt_inv, sdd, h, w = make_camera(device)
+    expected = render(ref, k_inv, rt_inv, sdd, h, w, n_samples=100, backend="metal", soft_labels=True)
+    out = render(low, k_inv, rt_inv, sdd, h, w, n_samples=100, backend="metal", soft_labels=True)
+
+    tol = {torch.float16: 2e-3, torch.bfloat16: 1.6e-2}[dtype]
+    assert ((expected - out.float()).abs().max() / expected.abs().max()).item() < tol
+
+
+def test_metal_soft_labels_backward_compiles():
+    subject, k_inv, rt_inv, sdd, h, w = _setup(n_classes=3)
+    weights = torch.randn(1, 3, h, w, device="mps", generator=None)
+
+    def f(rt):
+        return render(subject, k_inv, rt, sdd, h, w, n_samples=100, backend="metal", soft_labels=True)
+
+    rt = rt_inv.clone().requires_grad_(True)
+    (f(rt) * weights).sum().backward()
+
+    torch._dynamo.reset()
+    rt_c = rt_inv.clone().requires_grad_(True)
+    (torch.compile(f, fullgraph=True)(rt_c) * weights).sum().backward()
+
+    ref = rt.grad[0, :3]
+    assert ((ref - rt_c.grad[0, :3]).abs().max() / ref.abs().max()).item() < 1e-3
+
+
+def test_auto_backend_picks_metal_for_soft_labels():
+    subject, k_inv, rt_inv, sdd, h, w = _setup(n_classes=3)
+    metal = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="metal", soft_labels=True)
+    auto = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="auto", soft_labels=True)
+
+    torch.testing.assert_close(auto, metal, rtol=0, atol=0)

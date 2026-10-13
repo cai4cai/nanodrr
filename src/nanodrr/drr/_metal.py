@@ -23,6 +23,18 @@ inline float fetch(device const T* v, int ix, int iy, int iz, int D, int H, int 
     return (float)v[(iz * H + iy) * W + ix];
 }
 
+// Add `val` to a per-thread running sum for class `cls`, flushing the sum to `o` when the
+// class changes: rays cross few class boundaries, so most samples never touch memory
+inline void accumulate(device float* o, int N, int C, float step, thread int& cur, thread float& run, int cls, float val) {
+    if (cls < 0 || cls >= C || val == 0.0f) return;
+    if (cls != cur) {
+        o[(long)cur * N] += run * step;
+        run = 0.0f;
+        cur = cls;
+    }
+    run += val;
+}
+
 struct Ray {
     float3 s, e, p0, dp;  // camera-space source and direction; voxel-space origin and direction
     int s_lo, s_hi;       // culled sample range
@@ -75,6 +87,7 @@ kernel void raymarch_fwd(
     constant int& C          [[buffer(12)]],
     constant int& src_ray_stride   [[buffer(13)]],
     constant int& src_batch_stride [[buffer(14)]],
+    constant int& soft       [[buffer(15)]],   // route each trilinear neighbor to its own label (C > 1)
     uint tid [[thread_position_in_grid]])
 {
     int gid = (int)tid;
@@ -83,8 +96,10 @@ kernel void raymarch_fwd(
     if (!r.hit) return;
 
     float inv_s = 1.0f / (float)(S - 1);
-    float acc1 = 0.0f;
     device float* o = out + (long)b * C * N + n;
+    float step = stp[gid];
+    int cur = 0;
+    float run = 0.0f;
 
     for (int k = r.s_lo; k < r.s_hi; ++k) {
         float3 p = r.p0 + ((float)k * inv_s) * r.dp;
@@ -92,22 +107,28 @@ kernel void raymarch_fwd(
         float3 f = p - f0;
         int ix = (int)f0.x, iy = (int)f0.y, iz = (int)f0.z;
 
+        if (soft) {
+            for (int corner = 0; corner < 8; ++corner) {
+                int cx = corner & 1, cy = (corner >> 1) & 1, cz = corner >> 2;
+                float w = (cx ? f.x : 1 - f.x) * (cy ? f.y : 1 - f.y) * (cz ? f.z : 1 - f.z);
+                float vj = fetch(vol, ix + cx, iy + cy, iz + cz, D, H, W);
+                int lj = (int)fetch(lab, ix + cx, iy + cy, iz + cz, D, H, W);
+                accumulate(o, N, C, step, cur, run, lj, vj * w);
+            }
+            continue;
+        }
+
         float c00 = mix(fetch(vol, ix, iy,     iz,     D, H, W), fetch(vol, ix + 1, iy,     iz,     D, H, W), f.x);
         float c01 = mix(fetch(vol, ix, iy + 1, iz,     D, H, W), fetch(vol, ix + 1, iy + 1, iz,     D, H, W), f.x);
         float c10 = mix(fetch(vol, ix, iy,     iz + 1, D, H, W), fetch(vol, ix + 1, iy,     iz + 1, D, H, W), f.x);
         float c11 = mix(fetch(vol, ix, iy + 1, iz + 1, D, H, W), fetch(vol, ix + 1, iy + 1, iz + 1, D, H, W), f.x);
         float val = mix(mix(c00, c01, f.y), mix(c10, c11, f.y), f.z);
 
-        if (C == 1) {
-            acc1 += val;
-        } else {
-            int cls = (int)fetch(lab, (int)rint(p.x), (int)rint(p.y), (int)rint(p.z), D, H, W);
-            if (cls >= 0 && cls < C) o[(long)cls * N] += val;
-        }
+        int cls = 0;
+        if (C > 1) cls = (int)fetch(lab, (int)rint(p.x), (int)rint(p.y), (int)rint(p.z), D, H, W);
+        accumulate(o, N, C, step, cur, run, cls, val);
     }
-    float step = stp[gid];
-    if (C == 1) o[0] = acc1 * step;
-    else for (int c = 0; c < C; ++c) o[(long)c * N] *= step;
+    o[(long)cur * N] += run * step;
 }
 
 kernel void raymarch_bwd(
@@ -133,6 +154,7 @@ kernel void raymarch_bwd(
     constant int& src_batch_stride [[buffer(19)]],
     constant int& need_gvol  [[buffer(20)]],
     constant int& need_gcam  [[buffer(21)]],
+    constant int& soft       [[buffer(22)]],
     uint tid [[thread_position_in_grid]])
 {
     int gid = (int)tid;
@@ -160,14 +182,29 @@ kernel void raymarch_bwd(
         float v100 = fetch(vol, ix, iy, iz + 1, D, H, W),     v101 = fetch(vol, ix + 1, iy, iz + 1, D, H, W);
         float v110 = fetch(vol, ix, iy + 1, iz + 1, D, H, W), v111 = fetch(vol, ix + 1, iy + 1, iz + 1, D, H, W);
 
+        // Soft labels: each neighbor feeds the channel of its own label, so weight it by that
+        // channel's upstream gradient and the single-channel derivatives below apply as is
+        float gj[8] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+        if (soft) {
+            for (int corner = 0; corner < 8; ++corner) {
+                int lj = (int)fetch(lab, ix + (corner & 1), iy + ((corner >> 1) & 1), iz + (corner >> 2), D, H, W);
+                gj[corner] = (lj >= 0 && lj < C) ? go[((long)b * C + lj) * N + n] : 0.0f;
+            }
+            v000 *= gj[0]; v001 *= gj[1]; v010 *= gj[2]; v011 *= gj[3];
+            v100 *= gj[4]; v101 *= gj[5]; v110 *= gj[6]; v111 *= gj[7];
+        }
+
         float c00 = mix(v000, v001, f.x), c01 = mix(v010, v011, f.x);
         float c10 = mix(v100, v101, f.x), c11 = mix(v110, v111, f.x);
         float val = mix(mix(c00, c01, f.y), mix(c10, c11, f.y), f.z);
 
-        int cls = 0;
-        if (C > 1) cls = (int)fetch(lab, (int)rint(p.x), (int)rint(p.y), (int)rint(p.z), D, H, W);
-        if (cls < 0 || cls >= C) continue;  // dropped in the forward pass
-        float gg = go[((long)b * C + cls) * N + n];
+        float gg = 1.0f;  // soft labels fold the upstream gradient into the neighbors
+        if (!soft) {
+            int cls = 0;
+            if (C > 1) cls = (int)fetch(lab, (int)rint(p.x), (int)rint(p.y), (int)rint(p.z), D, H, W);
+            if (cls < 0 || cls >= C) continue;  // dropped in the forward pass
+            gg = go[((long)b * C + cls) * N + n];
+        }
         float g = gg * step;
 
         // Analytic trilinear derivatives w.r.t. the voxel-space position
@@ -198,7 +235,7 @@ kernel void raymarch_bwd(
                 int jx = ix + cx, jy = iy + cy, jz = iz + cz;
                 if (jx < 0 || jx >= W || jy < 0 || jy >= H || jz < 0 || jz >= D) continue;
                 float w = (cx ? f.x : 1 - f.x) * (cy ? f.y : 1 - f.y) * (cz ? f.z : 1 - f.z);
-                atomic_fetch_add_explicit(&gvol[(jz * H + jy) * W + jx], g * w, memory_order_relaxed);
+                atomic_fetch_add_explicit(&gvol[(jz * H + jy) * W + jx], g * w * gj[corner], memory_order_relaxed);
             }
         }
     }
@@ -275,6 +312,7 @@ def metal_raymarch(
     n_samples: int,
     n_classes: int,
     width: int,
+    soft_labels: bool = False,
 ) -> torch.Tensor:
     """Fused ray march on MPS; same contract as `_fused.fused_raymarch`.
 
@@ -287,23 +325,24 @@ def metal_raymarch(
     out = torch.zeros(B, n_classes, N, device=vol.device, dtype=torch.float32)
     _kernel("raymarch_fwd", vol)(
         vol, lab, M.contiguous(), src, tgt, step, out,
-        N, D, H, W, n_samples, n_classes, *_src_strides(src),
+        N, D, H, W, n_samples, n_classes, *_src_strides(src), int(soft_labels and n_classes > 1),
         threads=B * N,
     )  # fmt: skip
     return out
 
 
 @metal_raymarch.register_fake
-def _(vol, lab, M, src, tgt, step, n_samples, n_classes, width):
+def _(vol, lab, M, src, tgt, step, n_samples, n_classes, width, soft_labels=False):
     B, N, _ = tgt.shape
     return torch.empty(B, n_classes, N, device=vol.device, dtype=torch.float32)
 
 
 def _setup_context(ctx, inputs, output):
-    vol, lab, M, src, tgt, step, n_samples, n_classes, _width = inputs
+    vol, lab, M, src, tgt, step, n_samples, n_classes, _width, soft_labels = inputs
     ctx.save_for_backward(vol, lab, M.contiguous(), src, tgt, step)
     ctx.n_samples = n_samples
     ctx.n_classes = n_classes
+    ctx.soft_labels = soft_labels
 
 
 @torch.library.custom_op("nanodrr::metal_raymarch_bwd", mutates_args=())
@@ -319,6 +358,7 @@ def _metal_raymarch_bwd(
     n_classes: int,
     need_gvol: bool,
     need_gcam: bool,
+    soft_labels: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward kernel launch: `(gvol, gM, gsrc, gtgt, gstep)`, unrequested ones empty."""
     if need_gvol and torch.are_deterministic_algorithms_enabled():
@@ -338,7 +378,7 @@ def _metal_raymarch_bwd(
     _kernel("raymarch_bwd", vol)(
         go.contiguous(), vol, lab, M.contiguous(), src, tgt, step,
         gM_part, gsrc, gtgt, gstep, gvol,
-        N, D, H, W, n_samples, n_classes, *_src_strides(src), int(need_gvol), int(need_gcam),
+        N, D, H, W, n_samples, n_classes, *_src_strides(src), int(need_gvol), int(need_gcam), int(soft_labels and n_classes > 1),
         threads=B * N,
     )  # fmt: skip
     # Per-ray partials are reduced here, so the pose gradient is deterministic
@@ -353,7 +393,7 @@ def _metal_raymarch_bwd(
 
 
 @_metal_raymarch_bwd.register_fake
-def _(go, vol, lab, M, src, tgt, step, n_samples, n_classes, need_gvol, need_gcam):
+def _(go, vol, lab, M, src, tgt, step, n_samples, n_classes, need_gvol, need_gcam, soft_labels=False):
     B, N, _ = tgt.shape
     f32 = torch.float32
     gM = torch.empty(B, 3, 4, device=M.device, dtype=f32)
@@ -369,7 +409,7 @@ def _backward(ctx, go):
     need_gvol = ctx.needs_input_grad[0]
     need_gcam = any(ctx.needs_input_grad[i] for i in (3, 4, 5))
     gvol, gM, gsrc, gtgt, gstep = _metal_raymarch_bwd(
-        go, vol, lab, M, src, tgt, step, ctx.n_samples, ctx.n_classes, need_gvol, need_gcam
+        go, vol, lab, M, src, tgt, step, ctx.n_samples, ctx.n_classes, need_gvol, need_gcam, ctx.soft_labels
     )
     if need_gcam:
         if src.shape[1] == 1:
@@ -378,7 +418,7 @@ def _backward(ctx, go):
             gsrc = gsrc.sum(dim=0, keepdim=True)
     return (
         gvol.to(vol.dtype) if need_gvol else None,
-        None,  # lab: nearest-neighbor lookup, not differentiable
+        None,  # lab: integer routing, not differentiable
         gM.to(M.dtype),
         gsrc.to(src.dtype) if need_gcam else None,
         gtgt.to(tgt.dtype) if need_gcam else None,
@@ -386,6 +426,7 @@ def _backward(ctx, go):
         None,  # n_samples
         None,  # n_classes
         None,  # width
+        None,  # soft_labels
     )
 
 
