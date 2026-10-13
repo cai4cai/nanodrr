@@ -8,6 +8,7 @@ A performance-oriented reimplementation of [`DiffDRR`](https://github.com/eigenv
 
 - Optimized, pure PyTorch implementation (**~5× faster than `DiffDRR` at baseline**)
 - Fused Triton rendering kernel, used by default on CUDA (**up to ~80× faster than `DiffDRR`**)
+- Fused Metal shader (experimental), used by default on MPS (**~3–10× faster than the PyTorch path forward, up to ~60× with pose gradients** on one Apple GPU)
 - Modular design (freely swap subjects, extrinsics, and intrinsics during rendering)
 - Compatibility with `torch.compile` and mixed precision
 - Extensive type hints with `jaxtyping`
@@ -23,6 +24,8 @@ All projective geometry is implemented internally using the standard [Hartley an
 > On `pytorch<2.9`, `torch.compile` with `bfloat16` is slower than eager for the pure PyTorch backend due to a CUDA graph capture issue (see [Benchmarks](#benchmarks)). The fused Triton backend is unaffected.
 > 
 > MPS-accelerated differentiable rendering requires `pytorch>=2.13`, which is the first release with native MPS kernels for `grid_sample` backwards and 3D nearest-neighbor sampling.
+>
+> The fused Metal shader (`backend="metal"`, picked automatically on MPS) is compiled at runtime with `torch.mps.compile_shader`; where that is unavailable, or the inputs are ineligible (e.g. deterministic algorithms with volume gradients), rendering falls back to the PyTorch path. Like the Triton kernel, it has no double backward.
 
 To strictly install the renderer:
 ```

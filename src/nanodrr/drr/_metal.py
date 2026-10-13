@@ -219,10 +219,10 @@ kernel void raymarch_bwd(
 _DTYPES = {torch.float32: ("float", "f32"), torch.float16: ("half", "f16"), torch.bfloat16: ("bfloat", "bf16")}
 
 
-def _build_source() -> str:
+def _build_source(dtypes) -> str:
     """The shared helpers plus one copy of the kernels per volume dtype (`raymarch_fwd_f16`, ...)."""
     out = [_HEADER]
-    for ctype, suffix in _DTYPES.values():
+    for ctype, suffix in (_DTYPES[dt] for dt in dtypes):
         body = _KERNELS.replace("raymarch_fwd", f"raymarch_fwd_{suffix}").replace(
             "raymarch_bwd", f"raymarch_bwd_{suffix}"
         )
@@ -231,15 +231,33 @@ def _build_source() -> str:
 
 
 @functools.cache
-def _library():
-    return torch.mps.compile_shader(_build_source())
+def _compiled():
+    """`(library, supported dtypes)`. bfloat16 needs a recent Metal language version, so
+    an OS that rejects it still gets float32 and float16."""
+    if not (torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader")):
+        raise RuntimeError("the metal backend needs an MPS device and torch.mps.compile_shader")
+    error = None
+    for dtypes in (list(_DTYPES), [torch.float32, torch.float16]):
+        try:
+            return torch.mps.compile_shader(_build_source(dtypes)), tuple(dtypes)
+        except Exception as e:  # noqa: BLE001  # shader compile errors surface as RuntimeError
+            error = e
+    raise RuntimeError(f"Metal shader compilation failed: {error}")
+
+
+def supports(dtype: torch.dtype) -> bool:
+    """Whether the fused kernels can run on this machine for a volume of `dtype` (compiles on first call)."""
+    try:
+        return dtype in _compiled()[1]
+    except RuntimeError:
+        return False
 
 
 def _kernel(name: str, vol: torch.Tensor):
     """The `name` kernel instantiated for the volume's dtype."""
-    if vol.dtype not in _DTYPES:
-        raise TypeError(f"metal backend supports float32, float16 and bfloat16 volumes, got {vol.dtype}")
-    return getattr(_library(), f"{name}_{_DTYPES[vol.dtype][1]}")
+    if not supports(vol.dtype):
+        raise TypeError(f"metal backend does not support {vol.dtype} volumes on this machine")
+    return getattr(_compiled()[0], f"{name}_{_DTYPES[vol.dtype][1]}")
 
 
 def _src_strides(src: torch.Tensor) -> tuple[int, int]:

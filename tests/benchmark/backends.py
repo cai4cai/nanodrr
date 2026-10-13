@@ -24,13 +24,10 @@ def available_backends(device: str) -> list[str]:
     """Backends runnable on `device`: torch everywhere, plus the fused kernel for that GPU."""
     backends = ["torch"]
     if device == "mps":
-        try:
-            from nanodrr.drr import _metal  # noqa: F401
+        from nanodrr.drr import _metal
 
-            torch.mps.compile_shader  # noqa: B018
+        if _metal.supports(torch.float32):
             backends.append("metal")
-        except Exception:
-            pass
     elif device == "cuda":
         try:
             import triton  # noqa: F401

@@ -18,6 +18,15 @@ def _triton_available() -> bool:
     return True
 
 
+@functools.cache
+def _metal_available(dtype: torch.dtype) -> bool:
+    try:
+        from . import _metal
+    except Exception:  # noqa: BLE001
+        return False
+    return _metal.supports(dtype)
+
+
 def render(
     subject: Subject,
     k_inv: Float[torch.Tensor, "B 3 3"],
@@ -58,11 +67,12 @@ def render(
         tgt: Pre-computed ray target positions (detector pixel locations) in
             camera coordinates. If `None`, computed from `k_inv` and `rt_inv`.
         backend: `"torch"` uses the reference `grid_sample` implementation;
-            `"triton"` uses the fused Triton kernel; `"metal"` (experimental,
-            MPS; float32, float16 or bfloat16 volumes, forward and backward)
-            uses a fused Metal shader; `"auto"` (default) picks `"triton"` on CUDA
-            with fp32/fp16/bf16 when eligible and `"torch"` otherwise. The backends agree to float32 sampling precision (~1e-5);
-            `"triton"` assumes an affine `rt_inv` and has no double backward.
+            `"triton"` uses the fused Triton kernel;
+            `"metal"` uses the fused Metal shader (MPS); `"auto"` (default) picks
+            `"triton"` on CUDA or `"metal"` on MPS with fp32/fp16/bf16 when eligible
+            and `"torch"` otherwise. The backends agree to float32 sampling precision
+            (~1e-5); `"triton"` and `"metal"` assume an affine `rt_inv` and have no
+            double backward.
 
     Returns:
         Rendered synthetic radiograph. Shape is `(B, C, H, W)` where `C` is
@@ -83,15 +93,19 @@ def render(
     step_size = (tgt - src).norm(dim=-1) / float(n_samples - 1)
 
     if backend == "auto":
+        # The fused kernels' shared limits: dtypes, int32 indexing, and atomics for volume gradients
         eligible = (
-            rt_inv.is_cuda
-            and dtype in _FUSED_DTYPES
+            dtype in _FUSED_DTYPES
             and subject.image.dtype in _FUSED_DTYPES
-            and not (torch.are_deterministic_algorithms_enabled() and subject.image.requires_grad)  # gvol uses atomics
+            and not (torch.are_deterministic_algorithms_enabled() and subject.image.requires_grad)
             and fused_supported(subject, max(rt_inv.shape[0], tgt.shape[0]), height * width)
-            and _triton_available()
         )
-        backend = "triton" if eligible else "torch"
+        if eligible and rt_inv.is_cuda and _triton_available():
+            backend = "triton"
+        elif eligible and rt_inv.is_mps and _metal_available(subject.image.dtype):
+            backend = "metal"
+        else:
+            backend = "torch"
     if backend == "triton":
         return render_fused(subject, rt_inv, src, tgt, step_size, n_samples, height, width)
     if backend == "metal":

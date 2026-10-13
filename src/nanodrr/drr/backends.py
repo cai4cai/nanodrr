@@ -64,7 +64,7 @@ def render_torch(
 
 
 def fused_supported(subject: Subject, B: int, n_pixels: int) -> bool:
-    """Hard limits of the fused kernel: one volume, int32 indexing."""
+    """Hard limits of the fused (Triton and Metal) kernels: one volume, int32 indexing."""
     N = B * n_pixels
     return subject.image.shape[0] == 1 and max(subject.image.numel(), subject.n_classes * N, 3 * N) < 2**31
 
@@ -135,6 +135,10 @@ def render_metal(
     """
     from ._metal import metal_raymarch
 
+    if not rt_inv.is_mps:
+        raise ValueError("backend='metal' requires MPS tensors; use backend='torch'")
+    if not fused_supported(subject, max(rt_inv.shape[0], tgt.shape[0]), height * width):
+        raise ValueError("inputs exceed the fused kernel's limits; use backend='torch'")
     C = subject.n_classes
     # Float16/bfloat16 volumes are read in place; the kernel promotes per sample
     # reshape (a view) rather than [0, 0]: its backward is a view too, whereas

@@ -219,3 +219,68 @@ def test_metal_pose_gradient_with_reduced_precision_volume(dtype):
 
     assert torch.isfinite(grads[1]).all()
     assert ((grads[0] - grads[1]).abs().max() / grads[0].abs().max()).item() < 2e-2
+
+
+def test_auto_backend_picks_metal_on_mps():
+    subject, k_inv, rt_inv, sdd, h, w = _setup()
+    metal = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="metal")
+    auto = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="auto")
+
+    torch.testing.assert_close(auto, metal, rtol=0, atol=0)  # bitwise: the same kernel ran
+    ref = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="torch")
+    assert not torch.equal(auto, ref)  # and it was not the grid_sample path
+
+
+def test_auto_backend_falls_back_to_torch_for_deterministic_volume_gradients():
+    """The volume gradient uses atomics, so deterministic mode must route to torch."""
+    subject, k_inv, rt_inv, sdd, h, w = _setup()
+    subject.convert_to_mu = False
+    subject._image_hu.requires_grad_(True)
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        auto = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="auto")
+        ref = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="torch")
+    finally:
+        torch.use_deterministic_algorithms(False)
+
+    torch.testing.assert_close(auto, ref, rtol=0, atol=0)
+
+
+def test_auto_backend_falls_back_to_torch_when_inputs_exceed_limits(monkeypatch):
+    monkeypatch.setattr("nanodrr.drr.renderer.fused_supported", lambda *args: False)
+    subject, k_inv, rt_inv, sdd, h, w = _setup()
+    auto = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="auto")
+    ref = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="torch")
+
+    torch.testing.assert_close(auto, ref, rtol=0, atol=0)
+
+
+def test_auto_backend_falls_back_to_torch_when_metal_lacks_dtype(monkeypatch):
+    from nanodrr.drr import renderer
+
+    monkeypatch.setattr("nanodrr.drr._metal.supports", lambda dtype: False)
+    renderer._metal_available.cache_clear()
+    try:
+        subject, k_inv, rt_inv, sdd, h, w = _setup()
+        auto = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="auto")
+        ref = render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="torch")
+    finally:
+        renderer._metal_available.cache_clear()
+
+    torch.testing.assert_close(auto, ref, rtol=0, atol=0)
+
+
+def test_metal_backend_rejects_oversized_inputs(monkeypatch):
+    monkeypatch.setattr("nanodrr.drr.backends.fused_supported", lambda *args: False)
+    subject, k_inv, rt_inv, sdd, h, w = _setup()
+
+    with pytest.raises(ValueError, match="limits"):
+        render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="metal")
+
+
+def test_metal_backend_rejects_non_mps_tensors():
+    subject = make_random_subject()
+    k_inv, rt_inv, sdd, h, w = make_camera(torch.device("cpu"))
+
+    with pytest.raises(ValueError, match="MPS"):
+        render(subject, k_inv, rt_inv, sdd, h, w, n_samples=64, backend="metal")

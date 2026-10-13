@@ -247,8 +247,8 @@ def test_invalid_n_samples_raises(device):
 
 
 def test_auto_backend_falls_back_to_torch(device):
-    if device.type == "cuda":
-        pytest.skip("auto selects the triton backend on CUDA")
+    if device.type in ("cuda", "mps"):
+        pytest.skip("auto selects a fused backend on GPUs; see test_metal.py")
     subject = make_random_subject().to(device)
     k_inv, rt_inv, sdd, height, width = make_camera(device)
 
