@@ -127,16 +127,24 @@ def render_metal(
     height: int,
     width: int,
 ) -> Float[torch.Tensor, "B C H W"]:
-    """Fused Metal implementation of `render` (experimental, MPS, float32)."""
+    """Fused Metal implementation of `render` (experimental, MPS).
+
+    Gradients are accumulated in float32. A float16 `rt_inv` can still overflow when its gradient is cast
+    back to half (pose gradients of a summed render reach ~1e5, beyond float16's 65504); keep poses in
+    float32 or use bfloat16.
+    """
     from ._metal import metal_raymarch
 
     C = subject.n_classes
     # Float16/bfloat16 volumes are read in place; the kernel promotes per sample
-    vol = subject.image[0, 0]
+    # reshape (a view) rather than [0, 0]: its backward is a view too, whereas
+    # select's backward materializes a full-volume zero tensor
+    D, H, W = subject.image.shape[2:]
+    vol = subject.image.reshape(D, H, W)
     if vol.dtype not in (torch.float32, torch.float16, torch.bfloat16):
         vol = vol.float()
     vol = vol.contiguous()
-    lab = subject.label[0, 0].to(vol.dtype).contiguous() if C > 1 else vol
+    lab = subject.label.reshape(D, H, W).to(vol.dtype).contiguous() if C > 1 else vol
     M = (subject.world_to_voxel.float() @ rt_inv.float())[:, :3, :]
     B = max(M.shape[0], tgt.shape[0])
     out = metal_raymarch(

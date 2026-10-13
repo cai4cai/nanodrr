@@ -202,3 +202,20 @@ def test_metal_backward_compiles():
 
     ref = rt.grad[0, :3]
     assert ((ref - rt_c.grad[0, :3]).abs().max() / ref.abs().max()).item() < 1e-3
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_metal_pose_gradient_with_reduced_precision_volume(dtype):
+    """The kernel accumulates pose gradients in float32, so a float32 pose stays finite and accurate
+    with a low-precision volume. (A float16 *pose* tensor can overflow: gradients reach ~1e5.)"""
+    device = torch.device("mps")
+    ref, low = _reduced(1, dtype, device)
+    k_inv, rt_inv, sdd, h, w = make_camera(device)
+    grads = []
+    for subject in (ref, low):
+        rt = rt_inv.clone().requires_grad_(True)
+        render(subject, k_inv, rt, sdd, h, w, n_samples=100, backend="metal").float().sum().backward()
+        grads.append(rt.grad[0, :3])
+
+    assert torch.isfinite(grads[1]).all()
+    assert ((grads[0] - grads[1]).abs().max() / grads[0].abs().max()).item() < 2e-2
