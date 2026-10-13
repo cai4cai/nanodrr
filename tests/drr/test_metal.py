@@ -1,6 +1,13 @@
 import pytest
 import torch
-from test_fused import Parity, _assert_render_parity, _render_both, make_camera, make_random_subject
+from test_fused import (
+    Parity,
+    _assert_grads_match,
+    _assert_render_parity,
+    _render_both,
+    make_camera,
+    make_random_subject,
+)
 
 from nanodrr.drr.renderer import render
 
@@ -75,8 +82,76 @@ def test_metal_half_precision_subject_matches_float32():
     assert ((ref - out.float()).abs().max() / ref.abs().max()).item() < 1e-2
 
 
-def test_metal_rejects_gradients():
+@pytest.mark.parametrize("orthographic", [False, True])
+def test_metal_matches_torch_pose_gradients(parity, orthographic):
+    _assert_grads_match(parity, "pose", orthographic=orthographic)
+
+
+@pytest.mark.parametrize("n_classes", [1, 3])
+def test_metal_matches_torch_volume_gradients(parity, n_classes):
+    _assert_grads_match(parity, "volume", n_classes=n_classes)
+
+
+def test_metal_matches_torch_intrinsics_gradients(parity):
+    _assert_grads_match(parity, "intrinsics")
+
+
+def test_metal_pose_gradients_deterministic():
+    """Per-ray partials are reduced in torch, so pose gradients are bitwise stable."""
+    subject, k_inv, rt_inv, sdd, h, w = _setup()
+    grads = []
+    for _ in range(2):
+        rt = rt_inv.clone().requires_grad_(True)
+        render(subject, k_inv, rt, sdd, h, w, n_samples=200, backend="metal").sum().backward()
+        grads.append(rt.grad.clone())
+
+    torch.testing.assert_close(grads[0], grads[1], rtol=0, atol=0)
+
+
+def test_metal_out_of_range_labels_have_finite_gradients():
+    subject, k_inv, rt_inv, sdd, h, w = _setup(n_classes=5)
+    subject.n_classes = 3
+    rt = rt_inv.clone().requires_grad_(True)
+    render(subject, k_inv, rt, sdd, h, w, n_samples=100, backend="metal").sum().backward()
+
+    assert torch.isfinite(rt.grad).all()
+
+
+def test_metal_batched_pose_gradients_match_torch(parity):
+    """Batched poses against a shared detector reduce gradients over the broadcast dims."""
+    from nanodrr.camera import make_rt_inv
+
+    grads = []
+    for backend, device in parity.runs():
+        subject = make_random_subject().to(device)
+        k_inv, _, sdd, h, w = make_camera(device)
+        rt = make_rt_inv(
+            torch.tensor([[5.0, -3.0, 8.0], [25.0, 4.0, -6.0]]),
+            torch.tensor([[1.0, 80.0, -2.0], [-3.0, 78.0, 5.0]]),
+            orientation="AP",
+            isocenter=torch.zeros(3),
+        ).to(device)
+        rt.requires_grad_(True)
+        render(subject, k_inv, rt, sdd, h, w, n_samples=200, backend=backend).sum().backward()
+        grads.append(rt.grad[:, :3].cpu())
+
+    ref, out = grads
+    assert ((ref - out).abs().max() / ref.abs().max()).item() < 1e-3
+
+
+def test_metal_backward_compiles():
+    """`torch.compile` must trace both kernel launches as opaque custom ops."""
     subject, k_inv, rt_inv, sdd, h, w = _setup()
 
-    with pytest.raises(NotImplementedError, match="backward"):
-        render(subject, k_inv, rt_inv.clone().requires_grad_(True), sdd, h, w, n_samples=100, backend="metal")
+    def f(rt):
+        return render(subject, k_inv, rt, sdd, h, w, n_samples=100, backend="metal")
+
+    rt = rt_inv.clone().requires_grad_(True)
+    f(rt).sum().backward()
+
+    torch._dynamo.reset()
+    rt_c = rt_inv.clone().requires_grad_(True)
+    torch.compile(f, fullgraph=True)(rt_c).sum().backward()
+
+    ref = rt.grad[0, :3]
+    assert ((ref - rt_c.grad[0, :3]).abs().max() / ref.abs().max()).item() < 1e-3

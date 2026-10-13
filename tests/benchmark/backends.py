@@ -4,7 +4,7 @@ Pairs: torch on cpu/mps/cuda, plus the fused kernels (metal on MPS, triton on CU
 Reports accuracy against torch on the same device, speed, and working-set memory
 (peak extra device memory while one render runs, on top of the resident volume).
 
-Usage: python tests/benchmark/backends.py [--labels] [--size 200 400] [--samples 500] [--batch 1]
+Usage: python tests/benchmark/backends.py [--grad] [--labels] [--size 200 400] [--samples 500] [--batch 1]
 """
 
 import argparse
@@ -38,6 +38,14 @@ def available_backends(device: str) -> list[str]:
         except ImportError:
             pass
     return backends
+
+
+def pose_grad(args, backend):
+    """Gradient of the summed render w.r.t. the pose (one forward + backward pass)."""
+    subject, k_inv, rt_inv, *rest = args
+    rt_inv = rt_inv.detach().clone().requires_grad_(True)
+    render(subject, k_inv, rt_inv, *rest, backend=backend).sum().backward()
+    return rt_inv.grad[:, :3]  # the homogeneous row's gradient is backend-specific
 
 
 def working_set_mb(func, device: str) -> float:
@@ -75,6 +83,7 @@ def main():
     p.add_argument("--labels", action="store_true", help="Multi-class rendering with the demo labelmap")
     p.add_argument("--size", type=int, nargs="+", default=[100, 200, 400], help="Square detector sizes")
     p.add_argument("--samples", type=int, default=500)
+    p.add_argument("--grad", action="store_true", help="Time forward + backward w.r.t. the pose")
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--device", nargs="+", default=None, choices=["cpu", "mps", "cuda"])
     p.add_argument("--runs", type=int, default=10)
@@ -97,9 +106,15 @@ def main():
             k = k.to(device).expand(a.batch, -1, -1)
             args = (subject, k, rt_inv, sdd, size, size, a.samples)
             ref = render(*args, backend="torch")
+            if a.grad:
+                ref = pose_grad(args, "torch")
             base_us = None
             for backend in available_backends(device):
-                run = functools.partial(render, *args, backend=backend)
+                run = (
+                    functools.partial(pose_grad, args, backend)
+                    if a.grad
+                    else functools.partial(render, *args, backend=backend)
+                )
 
                 err = ((run() - ref).abs().max() / ref.abs().max()).item()
                 iters = a.cpu_iterations if device == "cpu" else a.iterations

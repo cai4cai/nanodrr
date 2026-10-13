@@ -59,7 +59,7 @@ def render(
             camera coordinates. If `None`, computed from `k_inv` and `rt_inv`.
         backend: `"torch"` uses the reference `grid_sample` implementation;
             `"triton"` uses the fused Triton kernel; `"metal"` (experimental,
-            MPS, float32, forward only) uses a fused Metal shader; `"auto"` (default) picks
+            MPS, float32) uses a fused Metal shader; `"auto"` (default) picks
             `"triton"` on CUDA with fp32/fp16/bf16 when eligible and `"torch"`
             otherwise. The backends agree to float32 sampling precision (~1e-5);
             `"triton"` assumes an affine `rt_inv` and has no double backward.

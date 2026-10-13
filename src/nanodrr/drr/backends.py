@@ -127,11 +127,9 @@ def render_metal(
     height: int,
     width: int,
 ) -> Float[torch.Tensor, "B C H W"]:
-    """Fused Metal implementation of `render` (experimental, MPS, forward only, float32)."""
+    """Fused Metal implementation of `render` (experimental, MPS, float32)."""
     from ._metal import metal_raymarch
 
-    if rt_inv.requires_grad or subject.image.requires_grad:
-        raise NotImplementedError("backend='metal' has no backward pass yet; use backend='torch'")
     C = subject.n_classes
     vol = subject.image[0, 0].float().contiguous()
     lab = subject.label[0, 0].float().contiguous() if C > 1 else vol
@@ -141,7 +139,7 @@ def render_metal(
         vol,
         lab,
         M.expand(B, -1, -1),
-        src.expand(B, -1, -1).float().contiguous() if src.shape[1] != 1 else src.float().contiguous(),
+        src.expand(B, -1, -1).float().contiguous(),
         tgt.expand(B, -1, -1).float().contiguous(),
         step_size.expand(B, -1).float().contiguous(),
         n_samples,
